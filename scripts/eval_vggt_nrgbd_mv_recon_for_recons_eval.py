@@ -19,6 +19,8 @@ from pathlib import Path
 
 import numpy as np
 import open3d as o3d
+import torch
+import torch.nn.functional as F
 
 
 def default_recons_eval_root() -> Path:
@@ -58,7 +60,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache_file", help="Dataset cache file")
     parser.add_argument("--output_root", help="Output root for artifacts")
     parser.add_argument("--metric_csv", help="Output metric CSV path")
-    parser.add_argument("--pred_key", default="point_cloud_unproj", choices=["point_cloud_unproj", "point_map"])
+    parser.add_argument(
+        "--pred_key",
+        default="depth_unproject",
+        choices=["depth_unproject", "point_cloud_unproj", "point_map"],
+        help=(
+            "Prediction source. depth_unproject matches recons_eval's VGGT interface: "
+            "resize predicted depth to GT size, then unproject with predicted camera."
+        ),
+    )
     parser.add_argument("--load_img_size", type=int, default=518)
     parser.add_argument("--icp_threshold", type=float, default=0.1)
     parser.add_argument("--no_save_ply", action="store_true", help="Do not write pred/gt PLY files")
@@ -85,6 +95,56 @@ def load_pred_points(npz_path: Path, pred_key: str) -> np.ndarray:
     return pred_pts.astype(np.float32)
 
 
+def resize_depth_like_recons_eval(depth: np.ndarray, target_hw: tuple[int, int]) -> np.ndarray:
+    depth = np.squeeze(depth)
+    if depth.ndim == 2:
+        depth = depth[None]
+    if depth.ndim != 3:
+        raise ValueError(f"Expected depth shape (N,H,W), got {depth.shape}")
+    if depth.shape[-2:] == target_hw:
+        return depth.astype(np.float32)
+
+    depth_t = torch.from_numpy(depth.astype(np.float32))[:, None]
+    depth_t = F.interpolate(depth_t, target_hw, mode="bilinear", align_corners=False, antialias=True)
+    return depth_t[:, 0].cpu().numpy().astype(np.float32)
+
+
+def scale_intrinsics(intrinsic: np.ndarray, source_hw: tuple[int, int], target_hw: tuple[int, int]) -> np.ndarray:
+    if source_hw == target_hw:
+        return intrinsic.astype(np.float32)
+    source_h, source_w = source_hw
+    target_h, target_w = target_hw
+    scaled = intrinsic.astype(np.float32).copy()
+    scaled[:, 0, :] *= target_w / source_w
+    scaled[:, 1, :] *= target_h / source_h
+    return scaled
+
+
+def load_depth_unproject_points(npz_path: Path, target_hw: tuple[int, int], unproject_func) -> np.ndarray:
+    with np.load(npz_path) as data:
+        for key in ("depth", "extrinsic", "intrinsic"):
+            if key not in data:
+                raise KeyError(f"`{key}` not found in {npz_path}")
+        raw_depth = np.asarray(data["depth"])
+        extrinsic = np.asarray(data["extrinsic"]).astype(np.float32)
+        intrinsic = np.asarray(data["intrinsic"]).astype(np.float32)
+
+    source_depth = np.squeeze(raw_depth)
+    if source_depth.ndim == 2:
+        source_hw = source_depth.shape
+    elif source_depth.ndim == 3:
+        source_hw = source_depth.shape[-2:]
+    elif source_depth.ndim == 4:
+        source_hw = source_depth.shape[1:3]
+    else:
+        raise ValueError(f"Expected depth shape (N,H,W[,1]), got {raw_depth.shape} from {npz_path}")
+
+    depth = resize_depth_like_recons_eval(raw_depth, target_hw)
+    intrinsic = scale_intrinsics(intrinsic, source_hw, target_hw)
+    pred_pts = unproject_func(depth[..., None], extrinsic, intrinsic)
+    return pred_pts.astype(np.float32)
+
+
 def main() -> None:
     args = parse_args()
     recons_eval_root = Path(args.recons_eval_root)
@@ -92,6 +152,7 @@ def main() -> None:
 
     from datasets.nrgbd import NRGBD
     from mv_recon.utils import accuracy, completion, umeyama
+    from models.vggt.utils.geometry import unproject_depth_map_to_point_map
 
     vggt_root = Path(args.vggt_output_root)
     nrgbd_dir = Path(args.nrgbd_dir) if args.nrgbd_dir else recons_eval_root / "data" / "nrgbd"
@@ -148,7 +209,14 @@ def main() -> None:
         npz_path = vggt_root / seq_name / "vggt_outputs.npz"
         if not npz_path.exists():
             raise FileNotFoundError(npz_path)
-        pred_pts = load_pred_points(npz_path, args.pred_key)
+        if args.pred_key == "depth_unproject":
+            pred_pts = load_depth_unproject_points(
+                npz_path,
+                target_hw=gt_pts.shape[1:3],
+                unproject_func=unproject_depth_map_to_point_map,
+            )
+        else:
+            pred_pts = load_pred_points(npz_path, args.pred_key)
         if pred_pts.shape != gt_pts.shape:
             raise ValueError(f"{seq_name}: pred {pred_pts.shape} != gt {gt_pts.shape}")
 
